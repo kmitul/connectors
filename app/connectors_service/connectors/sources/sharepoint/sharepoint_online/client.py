@@ -29,7 +29,6 @@ from connectors.sources.sharepoint.sharepoint_online.constants import (
     FILE_WRITE_CHUNK_SIZE,
     GRAPH_API_AUTH_URL,
     GRAPH_API_URL,
-    REST_API_AUTH_URL,
     WILDCARD,
 )
 from connectors.sources.sharepoint.sharepoint_online.utils import (
@@ -215,7 +214,12 @@ class GraphAPIToken(SecretAPIToken):
 
 
 class SharepointRestAPIToken(SecretAPIToken):
-    """Token to connect to Sharepoint REST API endpoints."""
+    """Token to connect to Sharepoint REST API endpoints.
+
+    Uses Entra ID (OAuth2 client credentials) to obtain tokens for the
+    SharePoint REST API. Previously this class used the Azure Access Control
+    Service (ACS) endpoint, which Microsoft retired on April 2 2026.
+    """
 
     @retryable(retries=DEFAULT_RETRY_COUNT)
     async def _fetch_token(self):
@@ -225,15 +229,9 @@ class SharepointRestAPIToken(SecretAPIToken):
             (str, int) - a tuple containing access token as a string and number of seconds it will be valid for as an integer
         """
 
-        url = f"{REST_API_AUTH_URL}/{self._tenant_id}/tokens/OAuth/2"
-        # GUID in resource is always a constant used to create access token
-        data = {
-            "grant_type": "client_credentials",
-            "resource": f"00000003-0000-0ff1-ce00-000000000000/{self._tenant_name}.sharepoint.com@{self._tenant_id}",
-            "client_id": f"{self._client_id}@{self._tenant_id}",
-            "client_secret": self._client_secret,
-        }
+        url = f"{GRAPH_API_AUTH_URL}/{self._tenant_id}/oauth2/v2.0/token"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = f"client_id={self._client_id}&scope=https://{self._tenant_name}.sharepoint.com/.default&client_secret={self._client_secret}&grant_type=client_credentials"
 
         # We measure now before request to be on a pessimistic side
         now = datetime.utcnow()
@@ -695,6 +693,25 @@ class SharepointOnlineClient:
         except NotFound:
             return
 
+    async def site_group_id(self, site_name):
+        """Look up the M365 group ID for a group-connected SharePoint site.
+
+        Uses the convention that a Team site's M365 group has a mailNickname
+        matching the site name. Returns the group ID string, or None if no
+        matching group is found (e.g. Communication sites).
+        """
+        filter_ = url_encode(f"mailNickname eq '{site_name}' and groupTypes/any(c:c eq 'Unified')")
+        url = f"{GRAPH_API_URL}/groups?$filter={filter_}&$select=id"
+
+        try:
+            async for page in self._graph_api_client.scroll(url):
+                for group in page:
+                    return group.get("id")
+        except (NotFound, PermissionsMissing):
+            return None
+
+        return None
+
     async def group_members(self, group_id):
         url = f"{GRAPH_API_URL}/groups/{group_id}/members"
 
@@ -895,7 +912,7 @@ class SharepointOnlineClient:
         )
 
     async def site_lists(self, site_id):
-        select = "createdDateTime,id,lastModifiedDateTime,name,webUrl,displayName,createdBy,lastModifiedBy"
+        select = "createdDateTime,id,lastModifiedDateTime,name,webUrl,displayName,createdBy,lastModifiedBy,list"
 
         try:
             async for page in self._graph_api_client.scroll(
@@ -997,37 +1014,63 @@ class SharepointOnlineClient:
             f"{attachment_absolute_path}/$value", async_buffer
         )
 
-    async def site_pages(self, site_web_url):
-        self._validate_sharepoint_rest_url(site_web_url)
+    async def site_pages(self, site_id):
+        """Fetch site pages using Microsoft Graph API.
 
-        # select = "Id,Title,LayoutWebpartsContent,CanvasContent1,Description,Created,AuthorId,Modified,EditorId"
-        select = "*,EncodedAbsUrl"  # ^ is what we want, but site pages don't have consistent schemas, and this causes errors. Better to fetch all and slice
-        url = f"{site_web_url}/_api/web/lists/GetByTitle('Site%20Pages')/items?$select={select}"
+        Previously used the SharePoint REST API which requires ACS tokens
+        (retired April 2 2026). Now uses Graph API via
+        /sites/{siteId}/lists/{listId}/items to fetch Site Pages.
+        """
+
+        site_pages_list_id = await self._get_site_pages_list_id(site_id)
+
+        if not site_pages_list_id:
+            return
+
+        select = "id,createdDateTime,lastModifiedDateTime,webUrl"
+        expand = "fields"
+        url = f"{GRAPH_API_URL}/sites/{site_id}/lists/{site_pages_list_id}/items?$select={select}&$expand={expand}"
 
         try:
-            async for page in self._rest_api_client.scroll(url):
+            async for page in self._graph_api_client.scroll(url):
                 for site_page in page:
+                    fields = site_page.get("fields", {})
                     yield {
-                        "Id": site_page.get("Id"),
-                        "Title": site_page.get("Title"),
-                        "webUrl": site_page.get("EncodedAbsUrl"),
-                        "LayoutWebpartsContent": site_page.get("LayoutWebpartsContent"),
-                        "CanvasContent1": site_page.get("CanvasContent1"),
-                        "WikiField": site_page.get("WikiField"),
-                        "Description": site_page.get("Description"),
-                        "Created": site_page.get("Created"),
-                        "AuthorId": site_page.get("AuthorId"),
-                        "Modified": site_page.get("Modified"),
-                        "EditorId": site_page.get("EditorId"),
-                        "odata.id": site_page.get("odata.id"),
-                        "OData__UIVersionString": site_page.get(
-                            "OData__UIVersionString"
+                        "Id": site_page.get("id"),
+                        "Title": fields.get("Title"),
+                        "webUrl": site_page.get("webUrl"),
+                        "LayoutWebpartsContent": fields.get("LayoutWebpartsContent"),
+                        "CanvasContent1": fields.get("CanvasContent1"),
+                        "WikiField": fields.get("WikiField"),
+                        "Description": fields.get("Description"),
+                        "Created": site_page.get("createdDateTime"),
+                        "AuthorId": fields.get("AuthorLookupId"),
+                        "Modified": site_page.get("lastModifiedDateTime"),
+                        "EditorId": fields.get("EditorLookupId"),
+                        "odata.id": site_page.get("id"),
+                        "OData__UIVersionString": fields.get(
+                            "_UIVersionString"
                         ),
                     }
         except NotFound:
-            # I'm not sure if site can have no pages, but given how weird API is I put this here
-            # Just to be on a safe side
             return
+
+    async def _get_site_pages_list_id(self, site_id):
+        """Find the Site Pages list ID for a given site using Graph API."""
+
+        try:
+            async for page in self._graph_api_client.scroll(
+                f"{GRAPH_API_URL}/sites/{site_id}/lists?$select=id,name,displayName&$filter=displayName eq 'Site Pages'"
+            ):
+                for site_list in page:
+                    return site_list["id"]
+        except NotFound:
+            self._logger.debug(
+                f"No 'Site Pages' list found for site '{site_id}'"
+            )
+            return None
+
+        return None
 
     async def site_page_has_unique_role_assignments(self, site_web_url, site_page_id):
         self._validate_sharepoint_rest_url(site_web_url)
