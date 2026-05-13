@@ -906,6 +906,26 @@ class SharepointOnlineClient:
         except NotFound:
             return
 
+    async def drive_items_list_item_fields_batch(self, drive_id, drive_item_ids):
+        requests = []
+
+        for item_id in drive_item_ids:
+            fields_uri = f"/drives/{drive_id}/items/{item_id}/listItem/fields"
+            requests.append({"id": item_id, "method": "GET", "url": fields_uri})
+
+        if not requests:
+            return
+
+        try:
+            batch_url = f"{GRAPH_API_URL}/$batch"
+            batch_request = {"requests": requests}
+            batch_response = await self._graph_api_client.post(batch_url, batch_request)
+
+            for response in batch_response.get("responses", []):
+                yield response
+        except NotFound:
+            return
+
     async def download_drive_item(self, drive_id, item_id, async_buffer):
         await self._graph_api_client.pipe(
             f"{GRAPH_API_URL}/drives/{drive_id}/items/{item_id}/content", async_buffer
@@ -984,7 +1004,7 @@ class SharepointOnlineClient:
 
     async def site_list_items(self, site_id, list_id):
         select = "createdDateTime,id,lastModifiedDateTime,weburl,createdBy,lastModifiedBy,contentType"
-        expand = "fields($select=Title,Link,Attachments,LinkTitle,LinkFilename,Description,Conversation)"
+        expand = "fields"
 
         async for page in self._graph_api_client.scroll(
             f"{GRAPH_API_URL}/sites/{site_id}/lists/{list_id}/items?$select={select}&$expand={expand}"
