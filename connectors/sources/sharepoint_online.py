@@ -760,6 +760,20 @@ class SharepointOnlineClient:
         except NotFound:
             return
 
+    async def site_group_id(self, site_name):
+        """Look up the M365 group ID for a group-connected SharePoint site."""
+        filter_ = url_encode(f"mailNickname eq '{site_name}' and groupTypes/any(c:c eq 'Unified')")
+        url = f"{GRAPH_API_URL}/groups?$filter={filter_}&$select=id"
+
+        try:
+            async for page in self._graph_api_client.scroll(url):
+                for group in page:
+                    return group.get("id")
+        except (NotFound, PermissionsMissing):
+            return None
+
+        return None
+
     async def site_users(self, site_web_url):
         self._validate_sharepoint_rest_url(site_web_url)
 
@@ -914,7 +928,7 @@ class SharepointOnlineClient:
         )
 
     async def site_lists(self, site_id):
-        select = "createdDateTime,id,lastModifiedDateTime,name,webUrl,displayName,createdBy,lastModifiedBy"
+        select = "createdDateTime,id,lastModifiedDateTime,name,webUrl,displayName,createdBy,lastModifiedBy,list"
 
         try:
             async for page in self._graph_api_client.scroll(
@@ -1225,6 +1239,7 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         self._client = None
         self.site_group_cache = {}
+        self._site_m365_group_cache = {}
 
     def _set_internal_logger(self):
         self.client.set_logger(self._logger)
@@ -1451,57 +1466,114 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         return document
 
+    async def _get_site_m365_group_id(self, site):
+        """Extracts the M365 group ID backing a SharePoint site, if any.
+
+        Team sites are backed by an M365 group whose ID is available in the
+        Graph API site object. Communication sites have no group.
+        """
+        site_id = site["id"]
+        if site_id in self._site_m365_group_cache:
+            return self._site_m365_group_cache[site_id]
+
+        group = site.get("group", {})
+        group_id = group.get("id") if group else None
+
+        if not group_id:
+            group_id = site.get("groupId")
+
+        if not group_id:
+            site_name = site.get("name")
+            if site_name:
+                group_id = await self.client.site_group_id(site_name)
+
+        self._site_m365_group_cache[site_id] = group_id
+        return group_id
+
     async def _site_access_control(self, site):
         """Fetches all permissions for all owners, members and visitors of a given site.
-        All groups and/or persons, which have permissions for a given site are returned with their given identity prefix ("user", "group" or "email").
-        For the given site all groups and its corresponding members and owners (username and/or email) are fetched.
+
+        Uses the M365 group backing the site (via Graph API) instead of SharePoint
+        REST API role assignments. For group-connected sites (Team sites), members
+        and owners are resolved via /groups/{id}/members and /groups/{id}/owners.
+        Communication sites (no M365 group) return empty ACLs.
 
         Returns:
             tuple:
               - list: access control list for a given site
-                [
-                    "user:spo-admin",
-                    "user:spo-user",
-                    "email:some.user@spo.com",
-                    "group:1234-abcd-id"
-                ]
-            - list: subset of the former, applying only to site-admins for this site
-                [
-                  "user":spo-admin"
-                ]
+              - list: subset of the former, applying only to site-admins/owners
         """
 
         self._logger.debug(f"Looking at site: {site['id']} with url {site['webUrl']}")
         if not self._dls_enabled():
             return [], []
 
-        def _is_site_admin(user):
-            return user.get("IsSiteAdmin", False)
-
         access_control = set()
         site_admins_access_control = set()
 
-        async for role_assignment in self.client.site_role_assignments(site["webUrl"]):
-            member = role_assignment["Member"]
-            member_access_control = set()
-            member_access_control.update(
-                await self._get_access_control_from_role_assignment(role_assignment)
+        group_id = await self._get_site_m365_group_id(site)
+
+        if not group_id:
+            self._logger.warning(
+                f"Site '{site['webUrl']}' has no M365 group — cannot resolve "
+                f"site-level DLS via Graph API. Drive items will use item-level "
+                f"permissions if enabled, otherwise access will be unrestricted."
             )
+            return [], []
 
-            if _is_site_admin(member):
-                # These are likely in the "Owners" group for the site
-                site_admins_access_control |= member_access_control
+        async for owner in self.client.group_owners(group_id):
+            owner_acl = self._access_control_for_user(owner)
+            access_control.update(owner_acl)
+            site_admins_access_control.update(owner_acl)
 
-            access_control |= member_access_control
+        async for member in self.client.group_members(group_id):
+            member_type = member.get("@odata.type", "")
+            if member_type == "#microsoft.graph.group":
+                access_control.add(_prefix_group(member["id"]))
+            else:
+                access_control.update(self._access_control_for_user(member))
 
-        # This fetches the "Site Collection Administrators", which is distinct from the "Owners" group of the site
-        # however, both should have access to everything in the site, regardless of unique role assignments
-        async for member in self.client.site_admins(site["webUrl"]):
-            site_admins_access_control.update(
-                await self._access_control_for_member(member)
-            )
+        access_control.add(_prefix_group(group_id))
 
         return list(access_control), list(site_admins_access_control)
+
+    async def _resolve_site_group_via_graph(self, site_group_id, site_id):
+        """Resolves a SharePoint siteGroup to Entra group members via the site's M365 group.
+
+        For standard site groups (Owners/Members), maps them to the M365 group's
+        owners/members. Returns a list of access control strings, or None if the
+        siteGroup could not be mapped (caller should fall back to site-level ACL).
+        """
+        group_id = self._site_m365_group_cache.get(site_id)
+        if not group_id:
+            return None
+
+        cache_key = (site_id, site_group_id)
+        if cache_key in self.site_group_cache:
+            return self.site_group_cache[cache_key]
+
+        access_control = []
+
+        try:
+            async for member in self.client.group_members(group_id):
+                member_type = member.get("@odata.type", "")
+                if member_type == "#microsoft.graph.group":
+                    access_control.append(_prefix_group(member["id"]))
+                else:
+                    access_control.extend(self._access_control_for_user(member))
+
+            async for owner in self.client.group_owners(group_id):
+                access_control.extend(self._access_control_for_user(owner))
+        except Exception as e:
+            self._logger.warning(
+                f"Failed to resolve siteGroup '{site_group_id}' via M365 group "
+                f"'{group_id}': {e}. Falling back to site-level ACL."
+            )
+            self.site_group_cache[cache_key] = None
+            return None
+
+        self.site_group_cache[cache_key] = access_control
+        return access_control
 
     def _dls_enabled(self):
         if self._features is None:
@@ -1665,23 +1737,32 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         # If not in cache, fetch the users
         users = []
-        async for site_group_user in self.client.site_groups_users(
-            site_web_url, site_group_id
-        ):
-            users.append(site_group_user)
+        try:
+            async for site_group_user in self.client.site_groups_users(
+                site_web_url, site_group_id
+            ):
+                users.append(site_group_user)
+        except PermissionsMissing:
+            self._logger.warning(
+                f"Unable to fetch site group users for group '{site_group_id}' at '{site_web_url}' "
+                "via REST API (likely due to ACS retirement). "
+                "DLS access control for this site group will be incomplete."
+            )
 
         # Cache the result
         self.site_group_cache[cache_key] = users
         return users
 
     async def _drive_items_batch_with_permissions(
-        self, drive_id, drive_items_batch, site_web_url
+        self, drive_id, drive_items_batch, site_web_url, site_id=None
     ):
         """Decorate a batch of drive items with their permissions using one API request.
 
         Args:
             drive_id (int): id of the drive, where the drive items reside
             drive_items_batch (list): list of drive items to decorate with permissions
+            site_web_url (str): the web URL of the site
+            site_id (str): the Graph API site ID, used for siteGroup resolution via Graph
 
         Yields:
             drive_item (dict): drive item with or without permissions depending on the config value of `fetch_drive_item_permissions`
@@ -1727,7 +1808,7 @@ class SharepointOnlineDataSource(BaseDataSource):
 
             if drive_item:
                 yield await self._with_drive_item_permissions(
-                    drive_item, permissions, site_web_url
+                    drive_item, permissions, site_web_url, site_id=site_id
                 )
 
     async def get_docs(self, filtering=None):
@@ -1771,7 +1852,7 @@ class SharepointOnlineDataSource(BaseDataSource):
                             async for (
                                 drive_item
                             ) in self._drive_items_batch_with_permissions(
-                                site_drive["id"], drive_items_batch, site["webUrl"]
+                                site_drive["id"], drive_items_batch, site["webUrl"], site_id=site["id"]
                             ):
                                 drive_item["_id"] = drive_item["id"]
                                 drive_item["object_type"] = "drive_item"
@@ -1883,7 +1964,7 @@ class SharepointOnlineDataSource(BaseDataSource):
                             async for (
                                 drive_item
                             ) in self._drive_items_batch_with_permissions(
-                                site_drive["id"], drive_items_batch, site["webUrl"]
+                                site_drive["id"], drive_items_batch, site["webUrl"], site_id=site["id"]
                             ):
                                 drive_item["_id"] = drive_item["id"]
                                 drive_item["object_type"] = "drive_item"
@@ -1982,13 +2063,15 @@ class SharepointOnlineDataSource(BaseDataSource):
                 yield site_drive
 
     async def _with_drive_item_permissions(
-        self, drive_item, drive_item_permissions, site_web_url
+        self, drive_item, drive_item_permissions, site_web_url, site_id=None
     ):
         """Decorates a drive item with its permissions.
 
         Args:
             drive_item (dict): drive item to fetch the permissions for.
             drive_item_permissions (list): drive item permissions to add to the drive_item.
+            site_web_url (str): the web URL of the site.
+            site_id (str): the Graph API site ID, used for siteGroup resolution via Graph.
 
         Returns:
             drive_item (dict): drive item decorated with its permissions.
@@ -2080,10 +2163,28 @@ class SharepointOnlineDataSource(BaseDataSource):
                 access_control.append(_prefix_user(site_user_username))
 
             if site_group_id:
-                users = await self.site_group_users(site_web_url, site_group_id)
-                for site_group_user in users:  # note, 'users' might contain groups.
-                    access_control.extend(
-                        await self._access_control_for_member(site_group_user)
+                if site_id:
+                    graph_acl = await self._resolve_site_group_via_graph(
+                        site_group_id, site_id
+                    )
+                    if graph_acl is not None:
+                        access_control.extend(graph_acl)
+                        continue
+
+                self._logger.debug(
+                    f"Falling back to REST API for siteGroup '{site_group_id}' "
+                    f"at '{site_web_url}'"
+                )
+                try:
+                    users = await self.site_group_users(site_web_url, site_group_id)
+                    for site_group_user in users:
+                        access_control.extend(
+                            await self._access_control_for_member(site_group_user)
+                        )
+                except PermissionsMissing:
+                    self._logger.warning(
+                        f"Could not resolve siteGroup '{site_group_id}' via REST API "
+                        f"at '{site_web_url}'. Skipping this siteGroup for DLS."
                     )
 
         return self._decorate_with_access_control(drive_item, access_control)
@@ -2139,32 +2240,37 @@ class SharepointOnlineDataSource(BaseDataSource):
                     self._dls_enabled()
                     and self.configuration["fetch_unique_list_item_permissions"]
                 ):
-                    has_unique_role_assignments = (
-                        await self.client.site_list_item_has_unique_role_assignments(
-                            site_web_url, site_list_name, list_item_natural_id
-                        )
-                    )
-
-                    if has_unique_role_assignments:
-                        self._logger.debug(
-                            f"Fetching unique permissions for list item with id '{list_item_natural_id}'. Ignoring parent site permissions."
+                    try:
+                        has_unique_role_assignments = (
+                            await self.client.site_list_item_has_unique_role_assignments(
+                                site_web_url, site_list_name, list_item_natural_id
+                            )
                         )
 
-                        list_item_access_control = []
-
-                        async for (
-                            role_assignment
-                        ) in self.client.site_list_item_role_assignments(
-                            site_web_url, site_list_name, list_item_natural_id
-                        ):
-                            list_item_access_control.extend(
-                                await self._get_access_control_from_role_assignment(
-                                    role_assignment
-                                )
+                        if has_unique_role_assignments:
+                            self._logger.debug(
+                                f"Fetching unique permissions for list item with id '{list_item_natural_id}'. Ignoring parent site permissions."
                             )
 
-                        list_item = self._decorate_with_access_control(
-                            list_item, list_item_access_control
+                            list_item_access_control = []
+
+                            async for (
+                                role_assignment
+                            ) in self.client.site_list_item_role_assignments(
+                                site_web_url, site_list_name, list_item_natural_id
+                            ):
+                                list_item_access_control.extend(
+                                    await self._get_access_control_from_role_assignment(
+                                        role_assignment
+                                    )
+                                )
+
+                            list_item = self._decorate_with_access_control(
+                                list_item, list_item_access_control
+                            )
+                    except PermissionsMissing:
+                        self._logger.warning(
+                            f"Unable to fetch unique permissions for list item '{list_item_natural_id}' via REST API. Falling back to parent site permissions."
                         )
 
                 if not has_unique_role_assignments:
@@ -2213,6 +2319,11 @@ class SharepointOnlineDataSource(BaseDataSource):
 
     async def site_lists(self, site, site_access_control, check_timestamp=False):
         async for site_list in self.client.site_lists(site["id"]):
+            if site_list.get("list", {}).get("hidden", False):
+                self._logger.debug(
+                    f"Filtering out hidden list '{site_list.get('name', 'unknown')}'"
+                )
+                continue
             if not check_timestamp or (
                 check_timestamp
                 and site_list["lastModifiedDateTime"] >= self.last_sync_time()
@@ -2228,32 +2339,37 @@ class SharepointOnlineDataSource(BaseDataSource):
                     self._dls_enabled()
                     and self.configuration["fetch_unique_list_permissions"]
                 ):
-                    has_unique_role_assignments = (
-                        await self.client.site_list_has_unique_role_assignments(
-                            site_url, site_list_name
-                        )
-                    )
-
-                    if has_unique_role_assignments:
-                        self._logger.debug(
-                            f"Fetching unique list permissions for list with id '{site_list['_id']}'. Ignoring parent site permissions."
+                    try:
+                        has_unique_role_assignments = (
+                            await self.client.site_list_has_unique_role_assignments(
+                                site_url, site_list_name
+                            )
                         )
 
-                        site_list_access_control = []
-
-                        async for (
-                            role_assignment
-                        ) in self.client.site_list_role_assignments(
-                            site_url, site_list_name
-                        ):
-                            site_list_access_control.extend(
-                                await self._get_access_control_from_role_assignment(
-                                    role_assignment
-                                )
+                        if has_unique_role_assignments:
+                            self._logger.debug(
+                                f"Fetching unique list permissions for list with id '{site_list['_id']}'. Ignoring parent site permissions."
                             )
 
-                        site_list = self._decorate_with_access_control(
-                            site_list, site_list_access_control
+                            site_list_access_control = []
+
+                            async for (
+                                role_assignment
+                            ) in self.client.site_list_role_assignments(
+                                site_url, site_list_name
+                            ):
+                                site_list_access_control.extend(
+                                    await self._get_access_control_from_role_assignment(
+                                        role_assignment
+                                    )
+                                )
+
+                            site_list = self._decorate_with_access_control(
+                                site_list, site_list_access_control
+                            )
+                    except PermissionsMissing:
+                        self._logger.warning(
+                            f"Unable to fetch unique permissions for list '{site_list_name}' via REST API. Falling back to parent site permissions."
                         )
 
                 if not has_unique_role_assignments:
@@ -2354,32 +2470,37 @@ class SharepointOnlineDataSource(BaseDataSource):
                     self._dls_enabled()
                     and self.configuration["fetch_unique_page_permissions"]
                 ):
-                    has_unique_role_assignments = (
-                        await self.client.site_page_has_unique_role_assignments(
-                            url, site_page["Id"]
-                        )
-                    )
-
-                    if has_unique_role_assignments:
-                        self._logger.debug(
-                            f"Fetching unique page permissions for page with id '{site_page['_id']}'. Ignoring parent site permissions."
+                    try:
+                        has_unique_role_assignments = (
+                            await self.client.site_page_has_unique_role_assignments(
+                                url, site_page["Id"]
+                            )
                         )
 
-                        page_access_control = []
-
-                        async for (
-                            role_assignment
-                        ) in self.client.site_page_role_assignments(
-                            url, site_page["Id"]
-                        ):
-                            page_access_control.extend(
-                                await self._get_access_control_from_role_assignment(
-                                    role_assignment
-                                )
+                        if has_unique_role_assignments:
+                            self._logger.debug(
+                                f"Fetching unique page permissions for page with id '{site_page['_id']}'. Ignoring parent site permissions."
                             )
 
-                        site_page = self._decorate_with_access_control(
-                            site_page, page_access_control
+                            page_access_control = []
+
+                            async for (
+                                role_assignment
+                            ) in self.client.site_page_role_assignments(
+                                url, site_page["Id"]
+                            ):
+                                page_access_control.extend(
+                                    await self._get_access_control_from_role_assignment(
+                                        role_assignment
+                                    )
+                                )
+
+                            site_page = self._decorate_with_access_control(
+                                site_page, page_access_control
+                            )
+                    except PermissionsMissing:
+                        self._logger.warning(
+                            f"Unable to fetch unique permissions for page '{site_page.get('Id')}' via REST API. Falling back to parent site permissions."
                         )
 
                 # set parent site access control
