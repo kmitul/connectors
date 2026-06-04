@@ -1030,37 +1030,56 @@ class SharepointOnlineClient:
             f"{attachment_absolute_path}/$value", async_buffer
         )
 
-    async def site_pages(self, site_web_url):
-        self._validate_sharepoint_rest_url(site_web_url)
+    async def site_pages(self, site_id):
+        """Fetch site pages using Microsoft Graph API instead of REST API (ACS retired)."""
+        site_pages_list_id = await self._get_site_pages_list_id(site_id)
 
-        # select = "Id,Title,LayoutWebpartsContent,CanvasContent1,Description,Created,AuthorId,Modified,EditorId"
-        select = "*,EncodedAbsUrl"  # ^ is what we want, but site pages don't have consistent schemas, and this causes errors. Better to fetch all and slice
-        url = f"{site_web_url}/_api/web/lists/GetByTitle('Site%20Pages')/items?$select={select}"
+        if not site_pages_list_id:
+            return
+
+        select = "id,createdDateTime,lastModifiedDateTime,webUrl"
+        expand = "fields"
+        url = f"{GRAPH_API_URL}/sites/{site_id}/lists/{site_pages_list_id}/items?$select={select}&$expand={expand}"
 
         try:
-            async for page in self._rest_api_client.scroll(url):
+            async for page in self._graph_api_client.scroll(url):
                 for site_page in page:
+                    fields = site_page.get("fields", {})
                     yield {
-                        "Id": site_page.get("Id"),
-                        "Title": site_page.get("Title"),
-                        "webUrl": site_page.get("EncodedAbsUrl"),
-                        "LayoutWebpartsContent": site_page.get("LayoutWebpartsContent"),
-                        "CanvasContent1": site_page.get("CanvasContent1"),
-                        "WikiField": site_page.get("WikiField"),
-                        "Description": site_page.get("Description"),
-                        "Created": site_page.get("Created"),
-                        "AuthorId": site_page.get("AuthorId"),
-                        "Modified": site_page.get("Modified"),
-                        "EditorId": site_page.get("EditorId"),
-                        "odata.id": site_page.get("odata.id"),
-                        "OData__UIVersionString": site_page.get(
-                            "OData__UIVersionString"
+                        "Id": site_page.get("id"),
+                        "Title": fields.get("Title"),
+                        "webUrl": site_page.get("webUrl"),
+                        "LayoutWebpartsContent": fields.get("LayoutWebpartsContent"),
+                        "CanvasContent1": fields.get("CanvasContent1"),
+                        "WikiField": fields.get("WikiField"),
+                        "Description": fields.get("Description"),
+                        "Created": site_page.get("createdDateTime"),
+                        "AuthorId": fields.get("AuthorLookupId"),
+                        "Modified": site_page.get("lastModifiedDateTime"),
+                        "EditorId": fields.get("EditorLookupId"),
+                        "odata.id": site_page.get("id"),
+                        "OData__UIVersionString": fields.get(
+                            "_UIVersionString"
                         ),
                     }
         except NotFound:
-            # I'm not sure if site can have no pages, but given how weird API is I put this here
-            # Just to be on a safe side
             return
+
+    async def _get_site_pages_list_id(self, site_id):
+        """Find the Site Pages list ID for a given site using Graph API."""
+        try:
+            async for page in self._graph_api_client.scroll(
+                f"{GRAPH_API_URL}/sites/{site_id}/lists?$select=id,name,displayName&$filter=displayName eq 'Site Pages'"
+            ):
+                for site_list in page:
+                    return site_list["id"]
+        except NotFound:
+            self._logger.debug(
+                f"No 'Site Pages' list found for site '{site_id}'"
+            )
+            return None
+
+        return None
 
     async def site_page_has_unique_role_assignments(self, site_web_url, site_page_id):
         self._validate_sharepoint_rest_url(site_web_url)
@@ -2449,7 +2468,7 @@ class SharepointOnlineDataSource(BaseDataSource):
     async def site_pages(self, site, site_access_control, check_timestamp=False):
         site_id = site["id"]
         url = site["webUrl"]
-        async for site_page in self.client.site_pages(url):
+        async for site_page in self.client.site_pages(site_id):
             if not check_timestamp or (
                 check_timestamp and site_page["Modified"] >= self.last_sync_time()
             ):
