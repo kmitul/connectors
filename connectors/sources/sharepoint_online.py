@@ -591,6 +591,7 @@ class SharepointOnlineClient:
             },
             timeout=aiohttp.ClientTimeout(total=None),
             raise_for_status=True,
+            trust_env=True,
         )
 
         self._tenant_id = tenant_id
