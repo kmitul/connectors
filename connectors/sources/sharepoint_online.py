@@ -61,11 +61,9 @@ if "OVERRIDE_URL" in os.environ:
     override_url = os.environ["OVERRIDE_URL"]
     GRAPH_API_URL = override_url
     GRAPH_API_AUTH_URL = override_url
-    REST_API_AUTH_URL = override_url
 else:
     GRAPH_API_URL = "https://graph.microsoft.com/v1.0"
     GRAPH_API_AUTH_URL = "https://login.microsoftonline.com"
-    REST_API_AUTH_URL = "https://accounts.accesscontrol.windows.net"
 
 DEFAULT_RETRY_COUNT = 5
 DEFAULT_RETRY_SECONDS = 30
@@ -293,7 +291,12 @@ class GraphAPIToken(SecretAPIToken):
 
 
 class SharepointRestAPIToken(SecretAPIToken):
-    """Token to connect to Sharepoint REST API endpoints."""
+    """Token to connect to Sharepoint REST API endpoints.
+
+    Uses Entra ID (OAuth2 client credentials) to obtain tokens for the
+    SharePoint REST API. Previously this class used the Azure Access Control
+    Service (ACS) endpoint, which Microsoft retired on April 2 2026.
+    """
 
     @retryable(retries=DEFAULT_RETRY_COUNT)
     async def _fetch_token(self):
@@ -303,15 +306,9 @@ class SharepointRestAPIToken(SecretAPIToken):
             (str, int) - a tuple containing access token as a string and number of seconds it will be valid for as an integer
         """
 
-        url = f"{REST_API_AUTH_URL}/{self._tenant_id}/tokens/OAuth/2"
-        # GUID in resource is always a constant used to create access token
-        data = {
-            "grant_type": "client_credentials",
-            "resource": f"00000003-0000-0ff1-ce00-000000000000/{self._tenant_name}.sharepoint.com@{self._tenant_id}",
-            "client_id": f"{self._client_id}@{self._tenant_id}",
-            "client_secret": self._client_secret,
-        }
+        url = f"{GRAPH_API_AUTH_URL}/{self._tenant_id}/oauth2/v2.0/token"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = f"client_id={self._client_id}&scope=https://{self._tenant_name}.sharepoint.com/.default&client_secret={self._client_secret}&grant_type=client_credentials"
 
         # We measure now before request to be on a pessimistic side
         now = datetime.utcnow()
