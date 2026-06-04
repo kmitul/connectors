@@ -922,6 +922,26 @@ class SharepointOnlineClient:
         except NotFound:
             return
 
+    async def drive_items_list_item_fields_batch(self, drive_id, drive_item_ids):
+        requests = []
+
+        for item_id in drive_item_ids:
+            fields_uri = f"/drives/{drive_id}/items/{item_id}/listItem/fields"
+            requests.append({"id": item_id, "method": "GET", "url": fields_uri})
+
+        if not requests:
+            return
+
+        try:
+            batch_url = f"{GRAPH_API_URL}/$batch"
+            batch_request = {"requests": requests}
+            batch_response = await self._graph_api_client.post(batch_url, batch_request)
+
+            for response in batch_response.get("responses", []):
+                yield response
+        except NotFound:
+            return
+
     async def download_drive_item(self, drive_id, item_id, async_buffer):
         await self._graph_api_client.pipe(
             f"{GRAPH_API_URL}/drives/{drive_id}/items/{item_id}/content", async_buffer
@@ -1000,7 +1020,7 @@ class SharepointOnlineClient:
 
     async def site_list_items(self, site_id, list_id):
         select = "createdDateTime,id,lastModifiedDateTime,weburl,createdBy,lastModifiedBy,contentType"
-        expand = "fields($select=Title,Link,Attachments,LinkTitle,LinkFilename,Description,Conversation)"
+        expand = "fields"
 
         async for page in self._graph_api_client.scroll(
             f"{GRAPH_API_URL}/sites/{site_id}/lists/{list_id}/items?$select={select}&$expand={expand}"
@@ -1775,7 +1795,7 @@ class SharepointOnlineDataSource(BaseDataSource):
     async def _drive_items_batch_with_permissions(
         self, drive_id, drive_items_batch, site_web_url, site_id=None
     ):
-        """Decorate a batch of drive items with their permissions using one API request.
+        """Decorate a batch of drive items with their permissions and list item fields using batch API requests.
 
         Args:
             drive_id (int): id of the drive, where the drive items reside
@@ -1787,6 +1807,22 @@ class SharepointOnlineDataSource(BaseDataSource):
             drive_item (dict): drive item with or without permissions depending on the config value of `fetch_drive_item_permissions`
         """
 
+        def _is_item_deleted(drive_item):
+            return self.drive_item_operation(drive_item) == OP_DELETE
+
+        non_deleted_ids_to_items = {
+            drive_item["id"]: drive_item
+            for drive_item in drive_items_batch
+            if not _is_item_deleted(drive_item)
+        }
+        async for fields_response in self.client.drive_items_list_item_fields_batch(
+            drive_id, list(non_deleted_ids_to_items.keys())
+        ):
+            item_id = fields_response.get("id")
+            item = non_deleted_ids_to_items.get(item_id)
+            if item and fields_response.get("status") == 200:
+                item["list_item_fields"] = fields_response.get("body", {})
+
         if (
             not self._dls_enabled()
             or not self.configuration["fetch_drive_item_permissions"]
@@ -1795,9 +1831,6 @@ class SharepointOnlineDataSource(BaseDataSource):
                 yield drive_item
 
             return
-
-        def _is_item_deleted(drive_item):
-            return self.drive_item_operation(drive_item) == OP_DELETE
 
         # Don't fetch access controls for deleted drive items
         deleted_drive_items = [
