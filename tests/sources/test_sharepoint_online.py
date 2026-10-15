@@ -241,6 +241,7 @@ async def create_spo_source(
     fetch_drive_item_permissions=True,
     fetch_unique_list_permissions=True,
     enumerate_all_sites=False,
+    compact_group_acl=False,
 ):
     async with create_source(
         SharepointOnlineDataSource,
@@ -255,6 +256,7 @@ async def create_spo_source(
         fetch_drive_item_permissions=fetch_drive_item_permissions,
         fetch_unique_list_permissions=fetch_unique_list_permissions,
         enumerate_all_sites=enumerate_all_sites,
+        compact_group_acl=compact_group_acl,
     ) as source:
         source.set_features(
             Features(
@@ -3337,6 +3339,69 @@ class TestSharepointOnlineDataSource:
                 extraction_service_mock.assert_not_called()
                 assert download_result["body"] == ""
                 assert "_attachment" not in download_result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "compact, member, expected",
+        [
+            # nested groups are always a group reference
+            (False, {"@odata.type": "#microsoft.graph.group", "id": "g1"}, ["group:g1"]),
+            (True, {"@odata.type": "#microsoft.graph.group", "id": "g1"}, ["group:g1"]),
+            # tenant users: expanded only when compact is off
+            (
+                False,
+                {"id": "u1", "mail": "a@corp.com", "userPrincipalName": "a@corp.com", "userType": "Member"},
+                ["user:a@corp.com", "email:a@corp.com", "user_id:u1"],
+            ),
+            (True, {"id": "u1", "mail": "a@corp.com", "userPrincipalName": "a@corp.com", "userType": "Member"}, []),
+            # guests are always listed, by userType or by the #EXT# UPN marker
+            (
+                True,
+                {"id": "u2", "mail": "x@ext.com", "userPrincipalName": "x_ext.com#EXT#@corp.onmicrosoft.com", "userType": "Guest"},
+                ["user:x_ext.com#EXT#@corp.onmicrosoft.com", "email:x@ext.com", "user_id:u2"],
+            ),
+            (
+                True,
+                {"id": "u3", "userPrincipalName": "y_ext.com#EXT#@corp.onmicrosoft.com"},
+                ["user:y_ext.com#EXT#@corp.onmicrosoft.com", "user_id:u3"],
+            ),
+        ],
+    )
+    async def test_access_control_for_group_member(self, compact, member, expected):
+        async with create_spo_source(
+            use_document_level_security=True, compact_group_acl=compact
+        ) as source:
+            assert source._access_control_for_group_member(member) == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("compact", [False, True])
+    async def test_site_access_control_compact_group_acl(self, compact):
+        async with create_spo_source(
+            use_document_level_security=True, compact_group_acl=compact
+        ) as source:
+            source._get_site_m365_group_id = AsyncMock(return_value="site-group")
+            source.client.group_owners = AsyncIterator(
+                [{"id": "o1", "mail": "owner@corp.com", "userType": "Member"}]
+            )
+            source.client.group_members = AsyncIterator(
+                [
+                    {"id": "o1", "mail": "owner@corp.com", "userType": "Member"},
+                    {"id": "m1", "mail": "member@corp.com", "userType": "Member"},
+                    {"id": "g1", "@odata.type": "#microsoft.graph.group"},
+                    {"id": "x1", "mail": "guest@ext.com", "userType": "Guest"},
+                ]
+            )
+
+            access_control, admins = await source._site_access_control(
+                {"id": "s1", "webUrl": "https://corp.sharepoint.com/sites/s1"}
+            )
+
+            # owners are kept either way: they are the site admins
+            assert set(admins) == {"email:owner@corp.com", "user_id:o1"}
+            assert {"group:site-group", "group:g1", "email:guest@ext.com", "user_id:x1"} <= set(access_control)
+            assert {"email:owner@corp.com", "user_id:o1"} <= set(access_control)
+            assert ("email:member@corp.com" in access_control) is not compact
+            assert ("user_id:m1" in access_control) is not compact
 
     @pytest.mark.asyncio
     async def test_site_access_control(self, patch_sharepoint_client):

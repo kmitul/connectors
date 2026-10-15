@@ -741,7 +741,9 @@ class SharepointOnlineClient:
             return
 
     async def group_members(self, group_id):
-        url = f"{GRAPH_API_URL}/groups/{group_id}/members"
+        # userType tells guests (external users) apart from tenant members.
+        select = "id,mail,userPrincipalName,userType"
+        url = f"{GRAPH_API_URL}/groups/{group_id}/members?$select={select}"
 
         try:
             async for page in self._graph_api_client.scroll(url):
@@ -1444,6 +1446,15 @@ class SharepointOnlineDataSource(BaseDataSource):
                 "type": "bool",
                 "value": True,
             },
+            "compact_group_acl": {
+                "depends_on": [{"field": "use_document_level_security", "value": True}],
+                "display": "toggle",
+                "label": "Use group IDs instead of listing group members",
+                "order": 17,
+                "tooltip": "When a document is shared with a Microsoft 365 group, store only the group's ID in its access control list instead of every member's identities. Guests (external users) are still listed individually. Requires the search side to resolve a user's group memberships.",
+                "type": "bool",
+                "value": False,
+            },
         }
 
     async def validate_config(self):
@@ -1567,11 +1578,7 @@ class SharepointOnlineDataSource(BaseDataSource):
             site_admins_access_control.update(owner_acl)
 
         async for member in self.client.group_members(group_id):
-            member_type = member.get("@odata.type", "")
-            if member_type == "#microsoft.graph.group":
-                access_control.add(_prefix_group(member["id"]))
-            else:
-                access_control.update(self._access_control_for_user(member))
+            access_control.update(self._access_control_for_group_member(member))
 
         access_control.add(_prefix_group(group_id))
 
@@ -1596,11 +1603,9 @@ class SharepointOnlineDataSource(BaseDataSource):
 
         try:
             async for member in self.client.group_members(group_id):
-                member_type = member.get("@odata.type", "")
-                if member_type == "#microsoft.graph.group":
-                    access_control.append(_prefix_group(member["id"]))
-                else:
-                    access_control.extend(self._access_control_for_user(member))
+                access_control.extend(self._access_control_for_group_member(member))
+            if self.configuration["compact_group_acl"]:
+                access_control.append(_prefix_group(group_id))
 
             async for owner in self.client.group_owners(group_id):
                 access_control.extend(self._access_control_for_user(owner))
@@ -2816,6 +2821,26 @@ class SharepointOnlineDataSource(BaseDataSource):
             return await self._access_control_for_group_id(group_id)
         else:
             return self._access_control_for_user(member)
+
+    def _access_control_for_group_member(self, member):
+        """ACL entries for one member of a site's Microsoft 365 group.
+
+        A nested group is always referenced by its id. With `compact_group_acl`
+        on, a tenant user is left out: the `group:<id>` entry stored alongside
+        already grants them access, and expanding every member is what makes the
+        ACL hundreds of entries long. Guests are still listed individually -- an
+        external identity can't be relied on to carry this tenant's group ids.
+        """
+        if member.get("@odata.type", "") == "#microsoft.graph.group":
+            return [_prefix_group(member["id"])]
+
+        is_guest = member.get("userType") == "Guest" or "#EXT#" in (
+            member.get("userPrincipalName") or ""
+        )
+        if self.configuration["compact_group_acl"] and not is_guest:
+            return []
+
+        return self._access_control_for_user(member)
 
     def _access_control_for_user(self, user):
         user_access_control = []
